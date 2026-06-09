@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>ジャンプランナー</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #1a1c2c;
+    touch-action: none;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-user-select: none;
+    user-select: none;
+    overscroll-behavior: none;
+  }
+  #game {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+'use strict';
+
+// ===== canvasセットアップ(リサイズ・高DPI対応) =====
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let W = 0, H = 0; // CSSピクセル単位の論理サイズ
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width = Math.round(W * dpr);
+  canvas.height = Math.round(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ===== 効果音 (Web Audio API・音源ファイル不要) =====
+let audioCtx = null;
+
+function ensureAudio() {
+  if (!audioCtx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (AC) audioCtx = new AC();
+  }
+  // モバイルの自動再生制限対策: ユーザー操作時に必ずresumeする
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+}
+
+function beep(startFreq, endFreq, duration, type, volume) {
+  if (!audioCtx || audioCtx.state !== 'running') return;
+  const t0 = audioCtx.currentTime;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(startFreq, t0);
+  osc.frequency.exponentialRampToValueAtTime(Math.max(endFreq, 1), t0 + duration);
+  gain.gain.setValueAtTime(volume, t0);
+  gain.gain.exponentialRampToValueAtTime(0.0001, t0 + duration);
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start(t0);
+  osc.stop(t0 + duration);
+}
+
+const sounds = {
+  jump()     { beep(300, 700, 0.15, 'square', 0.12); },
+  gameover() { beep(400, 60, 0.5, 'sawtooth', 0.15); },
+  milestone(){ beep(880, 1320, 0.12, 'sine', 0.1); },
+};
+
+// ===== ゲーム定数 =====
+const GROUND_RATIO = 0.78;   // 地面のY位置(画面高さに対する割合)
+const GRAVITY = 2600;        // px/s^2
+const JUMP_VELOCITY = -880;  // ジャンプ初速 px/s
+const HOLD_GRAVITY_SCALE = 0.45; // 長押し上昇中の重力倍率(可変ジャンプ)
+const BASE_SPEED = 320;      // スクロール速度 px/s
+const HITBOX_SHRINK = 0.22;  // 当たり判定を見た目より縮める割合
+
+// ===== ゲーム状態 =====
+let state = 'title'; // 'title' | 'playing' | 'gameover'
+let score = 0;
+let bestScore = 0;   // セッション中のみ保持(永続化なし)
+let lastMilestone = 0;
+let holding = false;
+let gameoverAt = 0;  // 誤タップで即リトライしないための猶予用
+
+const player = {
+  x: 0, y: 0, w: 44, h: 52,
+  vy: 0,
+  onGround: true,
+  runPhase: 0,
+};
+
+let obstacles = []; // { x, y, w, h, kind }
+let spawnTimer = 0;
+let bgOffset = 0;
+
+function groundY() { return H * GROUND_RATIO; }
+
+function resetGame() {
+  score = 0;
+  lastMilestone = 0;
+  obstacles = [];
+  spawnTimer = 0.5;
+  player.x = Math.max(60, W * 0.15);
+  player.y = groundY() - player.h;
+  player.vy = 0;
+  player.onGround = true;
+  player.runPhase = 0;
+}
+
+// ===== 入力 =====
+function pressDown() {
+  ensureAudio();
+  holding = true;
+  if (state === 'title') {
+    resetGame();
+    state = 'playing';
+    return;
+  }
+  if (state === 'gameover') {
+    if (performance.now() - gameoverAt > 600) {
+      resetGame();
+      state = 'playing';
+    }
+    return;
+  }
+  if (state === 'playing' && player.onGround) {
+    player.vy = JUMP_VELOCITY;
+    player.onGround = false;
+    sounds.jump();
+  }
+}
+
+function pressUp() {
+  holding = false;
+}
+
+canvas.addEventListener('touchstart', (e) => { e.preventDefault(); pressDown(); }, { passive: false });
+canvas.addEventListener('touchend',   (e) => { e.preventDefault(); pressUp(); },   { passive: false });
+canvas.addEventListener('touchcancel',(e) => { e.preventDefault(); pressUp(); },   { passive: false });
+canvas.addEventListener('mousedown', () => pressDown());
+canvas.addEventListener('mouseup',   () => pressUp());
+window.addEventListener('keydown', (e) => {
+  if ((e.code === 'Space' || e.code === 'ArrowUp') && !e.repeat) {
+    e.preventDefault();
+    pressDown();
+  }
+});
+window.addEventListener('keyup', (e) => {
+  if (e.code === 'Space' || e.code === 'ArrowUp') pressUp();
+});
+
+// ===== 障害物 =====
+function spawnObstacle() {
+  const kind = Math.random() < 0.65 ? 'cactus' : 'rock';
+  let w, h;
+  if (kind === 'cactus') {
+    w = 26 + Math.random() * 18;
+    h = 46 + Math.random() * 30;
+  } else {
+    w = 44 + Math.random() * 30;
+    h = 30 + Math.random() * 16;
+  }
+  obstacles.push({ x: W + w, y: groundY() - h, w, h, kind });
+  // 次の出現までの間隔(秒)。ジャンプで越えられる距離を保ちつつ揺らぎを持たせる
+  spawnTimer = 1.1 + Math.random() * 0.9;
+}
+
+function rectsOverlap(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+function shrunk(r) {
+  const sx = r.w * HITBOX_SHRINK / 2;
+  const sy = r.h * HITBOX_SHRINK / 2;
+  return { x: r.x + sx, y: r.y + sy, w: r.w - sx * 2, h: r.h - sy * 2 };
+}
+
+// ===== 更新 =====
+function update(dt) {
+  bgOffset += BASE_SPEED * 0.4 * dt;
+
+  if (state !== 'playing') return;
+
+  // スコア = 走った距離(10pxごとに1点)
+  score += BASE_SPEED * dt / 10;
+  const s = Math.floor(score);
+  if (s > 0 && Math.floor(s / 100) > Math.floor(lastMilestone / 100)) {
+    sounds.milestone();
+  }
+  lastMilestone = s;
+
+  // プレイヤー物理(長押し上昇中は重力を弱めて可変ジャンプ)
+  const g = (holding && player.vy < 0) ? GRAVITY * HOLD_GRAVITY_SCALE : GRAVITY;
+  player.vy += g * dt;
+  player.y += player.vy * dt;
+  if (player.y >= groundY() - player.h) {
+    player.y = groundY() - player.h;
+    player.vy = 0;
+    player.onGround = true;
+  }
+  player.runPhase += dt * 14;
+
+  // 障害物の生成とスクロール
+  spawnTimer -= dt;
+  if (spawnTimer <= 0) spawnObstacle();
+  for (const o of obstacles) o.x -= BASE_SPEED * dt;
+  obstacles = obstacles.filter((o) => o.x + o.w > -10);
+
+  // 当たり判定
+  const pBox = shrunk(player);
+  for (const o of obstacles) {
+    if (rectsOverlap(pBox, shrunk(o))) {
+      state = 'gameover';
+      gameoverAt = performance.now();
+      bestScore = Math.max(bestScore, Math.floor(score));
+      sounds.gameover();
+      break;
+    }
+  }
+}
+
+// ===== 描画 =====
+function drawBackground() {
+  // 空
+  const sky = ctx.createLinearGradient(0, 0, 0, groundY());
+  sky.addColorStop(0, '#29366f');
+  sky.addColorStop(1, '#3b5dc9');
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, W, groundY());
+
+  // 遠景の山(ゆっくり流れる)
+  ctx.fillStyle = '#1a1c2c';
+  const mw = 220;
+  const shift = (bgOffset * 0.3) % mw;
+  for (let x = -shift - mw; x < W + mw; x += mw) {
+    ctx.beginPath();
+    ctx.moveTo(x, groundY());
+    ctx.lineTo(x + mw / 2, groundY() - 90);
+    ctx.lineTo(x + mw, groundY());
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // 地面
+  ctx.fillStyle = '#38b764';
+  ctx.fillRect(0, groundY(), W, H - groundY());
+  ctx.fillStyle = '#257953';
+  ctx.fillRect(0, groundY(), W, 6);
+
+  // 地面の流れる模様
+  ctx.fillStyle = 'rgba(0,0,0,0.15)';
+  const dashW = 70;
+  const dashShift = bgOffset % dashW;
+  for (let x = -dashShift; x < W; x += dashW) {
+    ctx.fillRect(x, groundY() + 22, 34, 5);
+  }
+}
+
+function drawPlayer() {
+  const { x, y, w, h } = player;
+  // 体
+  ctx.fillStyle = '#ffcd75';
+  ctx.fillRect(x, y, w, h * 0.72);
+  // 目
+  ctx.fillStyle = '#1a1c2c';
+  ctx.fillRect(x + w * 0.62, y + h * 0.16, 7, 7);
+  // 足(走りアニメーション)
+  ctx.fillStyle = '#ef7d57';
+  const legTop = y + h * 0.72;
+  const legH = h * 0.28;
+  if (player.onGround) {
+    const swing = Math.sin(player.runPhase) * w * 0.18;
+    ctx.fillRect(x + w * 0.12 + swing, legTop, 10, legH);
+    ctx.fillRect(x + w * 0.62 - swing, legTop, 10, legH);
+  } else {
+    ctx.fillRect(x + w * 0.12, legTop, 10, legH * 0.7);
+    ctx.fillRect(x + w * 0.62, legTop, 10, legH * 0.7);
+  }
+}
+
+function drawObstacles() {
+  for (const o of obstacles) {
+    if (o.kind === 'cactus') {
+      ctx.fillStyle = '#2f9e44';
+      ctx.fillRect(o.x, o.y, o.w, o.h);
+      ctx.fillStyle = '#1f7a35';
+      ctx.fillRect(o.x + o.w * 0.35, o.y, o.w * 0.3, o.h);
+    } else {
+      ctx.fillStyle = '#94a1b2';
+      ctx.beginPath();
+      ctx.moveTo(o.x, o.y + o.h);
+      ctx.lineTo(o.x + o.w * 0.5, o.y);
+      ctx.lineTo(o.x + o.w, o.y + o.h);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+}
+
+function drawCenteredText(text, y, size, color, weight) {
+  ctx.fillStyle = color;
+  ctx.font = `${weight || 'bold'} ${size}px system-ui, sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, W / 2, y);
+}
+
+function drawHUD() {
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'top';
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 22px system-ui, sans-serif';
+  ctx.fillText(`SCORE ${Math.floor(score)}`, W - 16, 14);
+  if (bestScore > 0) {
+    ctx.font = '15px system-ui, sans-serif';
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.fillText(`BEST ${bestScore}`, W - 16, 42);
+  }
+}
+
+function drawOverlay(alpha) {
+  ctx.fillStyle = `rgba(26, 28, 44, ${alpha})`;
+  ctx.fillRect(0, 0, W, H);
+}
+
+function draw() {
+  drawBackground();
+  drawObstacles();
+  drawPlayer();
+
+  if (state === 'playing') {
+    drawHUD();
+  } else if (state === 'title') {
+    drawOverlay(0.45);
+    drawCenteredText('ジャンプランナー', H * 0.36, Math.min(W * 0.09, 46), '#ffcd75');
+    drawCenteredText('タップでジャンプ!障害物をよけよう', H * 0.47, Math.min(W * 0.045, 20), '#fff', 'normal');
+    if (Math.floor(performance.now() / 600) % 2 === 0) {
+      drawCenteredText('タップでスタート', H * 0.6, Math.min(W * 0.06, 26), '#fff');
+    }
+  } else if (state === 'gameover') {
+    drawHUD();
+    drawOverlay(0.55);
+    drawCenteredText('ゲームオーバー', H * 0.36, Math.min(W * 0.08, 42), '#ef7d57');
+    drawCenteredText(`スコア ${Math.floor(score)}`, H * 0.47, Math.min(W * 0.06, 28), '#fff');
+    drawCenteredText(`ベスト ${bestScore}`, H * 0.54, Math.min(W * 0.045, 20), 'rgba(255,255,255,0.7)', 'normal');
+    if (performance.now() - gameoverAt > 600 && Math.floor(performance.now() / 600) % 2 === 0) {
+      drawCenteredText('タップでリトライ', H * 0.66, Math.min(W * 0.055, 24), '#fff');
+    }
+  }
+}
+
+// ===== メインループ(デルタタイム基準) =====
+let lastTime = performance.now();
+function loop(now) {
+  // タブ復帰などで巨大なdtにならないよう上限を設ける
+  const dt = Math.min((now - lastTime) / 1000, 1 / 20);
+  lastTime = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
