@@ -76,6 +76,7 @@ const sounds = {
   jump()     { beep(300, 700, 0.15, 'square', 0.12); },
   gameover() { beep(400, 60, 0.5, 'sawtooth', 0.15); },
   milestone(){ beep(880, 1320, 0.12, 'sine', 0.1); },
+  coin()     { beep(1318, 1976, 0.09, 'triangle', 0.12); },
 };
 
 // ===== ゲーム定数 =====
@@ -86,6 +87,8 @@ const HOLD_GRAVITY_SCALE = 0.45; // 長押し上昇中の重力倍率(可変ジ�
 const BASE_SPEED = 320;      // スクロール速度 px/s
 const HITBOX_SHRINK = 0.22;  // 当たり判定を見た目より縮める割合
 const PHASE_SCORE = 300;     // この点数ごとに景色(時間帯)が移り変わる
+const COIN_R = 13;           // コインの半径
+const COIN_SCORE = 10;       // コイン1枚のスコア
 
 // ===== カラーパレット(時間帯ごと) =====
 // スコアが伸びると 夕暮れ → 真夜中 → 夜明け → (ループ) と景色が変わる
@@ -94,6 +97,7 @@ const PALETTES = [
     skyTop: [24, 12, 60], skyMid: [88, 28, 118], horizon: [255, 92, 120],
     sunTop: [255, 216, 96], sunBot: [255, 64, 132],
     mtFar: [52, 22, 92], mtNear: [30, 12, 56],
+    city: [36, 16, 70], window: [255, 170, 130], cloud: [255, 140, 170],
     ridge: [255, 110, 190],
     ground: [16, 8, 36], grid: [255, 62, 160],
     starAlpha: 0.25, sunScale: 1,
@@ -102,6 +106,7 @@ const PALETTES = [
     skyTop: [5, 7, 26], skyMid: [16, 18, 58], horizon: [56, 44, 140],
     sunTop: [225, 235, 255], sunBot: [150, 170, 255],
     mtFar: [20, 16, 52], mtNear: [10, 8, 32],
+    city: [12, 10, 38], window: [130, 220, 255], cloud: [90, 110, 200],
     ridge: [90, 200, 255],
     ground: [5, 6, 22], grid: [44, 220, 255],
     starAlpha: 1, sunScale: 0.55,
@@ -110,6 +115,7 @@ const PALETTES = [
     skyTop: [44, 18, 78], skyMid: [160, 44, 112], horizon: [255, 152, 86],
     sunTop: [255, 244, 170], sunBot: [255, 122, 86],
     mtFar: [70, 28, 88], mtNear: [40, 16, 56],
+    city: [52, 22, 76], window: [255, 205, 140], cloud: [255, 180, 140],
     ridge: [255, 170, 120],
     ground: [20, 10, 36], grid: [255, 140, 90],
     starAlpha: 0.45, sunScale: 0.8,
@@ -123,6 +129,11 @@ function lerpColor(c1, c2, t) {
 function rgb(c, a) {
   const r = c[0] | 0, g = c[1] | 0, b = c[2] | 0;
   return a === undefined ? `rgb(${r},${g},${b})` : `rgba(${r},${g},${b},${a})`;
+}
+// 決定的な疑似乱数(同じ街並み・ヤシ並木がスクロールしても安定して再現される)
+function hash(n) {
+  const s = Math.sin(n * 127.1) * 43758.5453;
+  return s - Math.floor(s);
 }
 
 // 現在のスコアに応じてパレットを補間(フェーズ終盤20%で次の時間帯へ滑らかに遷移)
@@ -156,8 +167,11 @@ const player = {
   runPhase: 0,
 };
 
-let obstacles = []; // { x, y, w, h, kind }
+let obstacles = []; // { x, y, w, h, kind, ... }
 let spawnTimer = 0;
+let coins = [];     // { x, y, phase }
+let coinTimer = 2;
+let floatTexts = []; // コイン取得時の「+10」表示 { x, y, text, life }
 let bgOffset = 0;
 
 // 星空(画面比率で配置し、ゆっくり流れる)
@@ -168,13 +182,34 @@ const stars = Array.from({ length: 70 }, () => ({
   phase: Math.random() * Math.PI * 2,
 }));
 
+// 雲(レトロな輪郭の雲がゆっくり流れる)
+const clouds = Array.from({ length: 4 }, () => ({
+  x: Math.random(),
+  y: 0.06 + Math.random() * 0.28,
+  s: 0.7 + Math.random() * 0.8,
+  sp: 0.6 + Math.random() * 0.8,
+}));
+
+// 路面を流れるスピードライン
+const speedLines = Array.from({ length: 14 }, () => ({
+  x: Math.random() * 2000,
+  t: Math.random(),
+}));
+
+// 流れ星
+let shootingStar = null;
+let shootTimer = 4;
+
 function groundY() { return H * GROUND_RATIO; }
 
 function resetGame() {
   score = 0;
   lastMilestone = 0;
   obstacles = [];
-  spawnTimer = 0.5;
+  coins = [];
+  floatTexts = [];
+  spawnTimer = 0.6;
+  coinTimer = 1.4;
   player.x = Math.max(60, W * 0.15);
   player.y = groundY() - player.h;
   player.vy = 0;
@@ -224,24 +259,52 @@ window.addEventListener('keyup', (e) => {
   if (e.code === 'Space' || e.code === 'ArrowUp') pressUp();
 });
 
-// ===== 障害物 =====
+// ===== 障害物・コインの生成 =====
 function spawnObstacle() {
-  const kind = Math.random() < 0.65 ? 'pylon' : 'pyramid';
-  let w, h;
-  if (kind === 'pylon') {
-    w = 26 + Math.random() * 18;
-    h = 46 + Math.random() * 30;
+  const roll = Math.random();
+  if (roll < 0.4) {
+    // ネオン土管(マリオの土管リスペクト)
+    const w = 40 + Math.random() * 14;
+    const h = 52 + Math.random() * 34;
+    obstacles.push({ kind: 'pipe', x: W + w, y: groundY() - h, w, h });
+    spawnTimer = 1.1 + Math.random() * 0.9;
+  } else if (roll < 0.75) {
+    // スパイク群(2〜4本のトゲ)
+    const n = 2 + Math.floor(Math.random() * 3);
+    const sw = 24;
+    const h = 30 + Math.random() * 14;
+    obstacles.push({ kind: 'spikes', x: W + n * sw, y: groundY() - h, w: n * sw, h, n });
+    spawnTimer = 1.2 + Math.random() * 0.9;
   } else {
-    w = 44 + Math.random() * 30;
-    h = 30 + Math.random() * 16;
+    // 飛行ドローン(ジャンプ中の高さを飛ぶ。跳ばずにくぐる!)
+    const w = 56, h = 32;
+    const baseY = groundY() - 112 - Math.random() * 40;
+    obstacles.push({ kind: 'drone', x: W + w, y: baseY, w, h, baseY, t: Math.random() * 6 });
+    spawnTimer = 1.3 + Math.random() * 1.0;
   }
-  obstacles.push({ x: W + w, y: groundY() - h, w, h, kind });
-  // 次の出現までの間隔(秒)。ジャンプで越えられる距離を保ちつつ揺らぎを持たせる
-  spawnTimer = 1.1 + Math.random() * 0.9;
+}
+
+function spawnCoins() {
+  const n = 3 + Math.floor(Math.random() * 3);
+  const startX = W + 80;
+  const arc = Math.random() < 0.5;
+  for (let i = 0; i < n; i++) {
+    const y = arc
+      ? groundY() - 80 - Math.sin((i / (n - 1)) * Math.PI) * 110 // ジャンプで取るアーチ状
+      : groundY() - 64;                                          // 走って取れる低い列
+    coins.push({ x: startX + i * 48, y, phase: i * 0.6 });
+  }
+  coinTimer = 2.6 + Math.random() * 2.2;
 }
 
 function rectsOverlap(a, b) {
   return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+function circleRectHit(cx, cy, r, b) {
+  const x = Math.max(b.x, Math.min(cx, b.x + b.w));
+  const y = Math.max(b.y, Math.min(cy, b.y + b.h));
+  return (cx - x) * (cx - x) + (cy - y) * (cy - y) < r * r;
 }
 
 function shrunk(r) {
@@ -254,9 +317,34 @@ function shrunk(r) {
 function update(dt) {
   bgOffset += BASE_SPEED * 0.4 * dt;
 
+  // 環境演出はどの状態でも動かし続ける(タイトル画面でも世界が生きて見える)
+  for (const sl of speedLines) {
+    sl.x -= BASE_SPEED * (0.5 + sl.t * 0.8) * dt;
+    if (sl.x < -80) { sl.x = W + Math.random() * 120; sl.t = Math.random(); }
+  }
+  shootTimer -= dt;
+  if (!shootingStar && shootTimer <= 0) {
+    shootingStar = {
+      x: W * (0.25 + Math.random() * 0.6),
+      y: H * (0.05 + Math.random() * 0.2),
+      vx: -(320 + Math.random() * 220),
+      vy: 130 + Math.random() * 90,
+      life: 0.9,
+    };
+    shootTimer = 6 + Math.random() * 8;
+  }
+  if (shootingStar) {
+    shootingStar.x += shootingStar.vx * dt;
+    shootingStar.y += shootingStar.vy * dt;
+    shootingStar.life -= dt;
+    if (shootingStar.life <= 0) shootingStar = null;
+  }
+  for (const ft of floatTexts) { ft.life -= dt; ft.y -= 44 * dt; }
+  floatTexts = floatTexts.filter((ft) => ft.life > 0);
+
   if (state !== 'playing') return;
 
-  // スコア = 走った距離(10pxごとに1点)
+  // スコア = 走った距離(10pxごとに1点)+ コインボーナス
   score += BASE_SPEED * dt / 10;
   const s = Math.floor(score);
   if (s > 0 && Math.floor(s / 100) > Math.floor(lastMilestone / 100)) {
@@ -278,11 +366,32 @@ function update(dt) {
   // 障害物の生成とスクロール
   spawnTimer -= dt;
   if (spawnTimer <= 0) spawnObstacle();
-  for (const o of obstacles) o.x -= BASE_SPEED * dt;
+  for (const o of obstacles) {
+    o.x -= BASE_SPEED * dt;
+    if (o.kind === 'drone') {
+      o.t += dt;
+      o.y = o.baseY + Math.sin(o.t * 4) * 9; // ふわふわ上下に揺れる
+    }
+  }
   obstacles = obstacles.filter((o) => o.x + o.w > -10);
 
-  // 当たり判定
+  // コインの生成・移動・取得
+  coinTimer -= dt;
+  if (coinTimer <= 0) spawnCoins();
   const pBox = shrunk(player);
+  for (const c of coins) {
+    c.x -= BASE_SPEED * dt;
+    c.phase += dt * 6;
+    if (!c.got && circleRectHit(c.x, c.y, COIN_R + 6, pBox)) {
+      c.got = true;
+      score += COIN_SCORE;
+      floatTexts.push({ x: c.x, y: c.y - 18, text: `+${COIN_SCORE}`, life: 0.8 });
+      sounds.coin();
+    }
+  }
+  coins = coins.filter((c) => !c.got && c.x > -30);
+
+  // 当たり判定
   for (const o of obstacles) {
     if (rectsOverlap(pBox, shrunk(o))) {
       state = 'gameover';
@@ -316,6 +425,23 @@ function drawStars(pal, now) {
   ctx.globalAlpha = 1;
 }
 
+function drawShootingStar(pal) {
+  if (!shootingStar) return;
+  const ss = shootingStar;
+  const alpha = Math.min(1, ss.life * 2) * Math.min(1, pal.starAlpha + 0.3);
+  const tailX = ss.x - ss.vx * 0.13;
+  const tailY = ss.y - ss.vy * 0.13;
+  const g = ctx.createLinearGradient(ss.x, ss.y, tailX, tailY);
+  g.addColorStop(0, `rgba(255,255,255,${alpha})`);
+  g.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.strokeStyle = g;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(ss.x, ss.y);
+  ctx.lineTo(tailX, tailY);
+  ctx.stroke();
+}
+
 function drawSun(pal) {
   const r = Math.min(W, H) * 0.21 * pal.sunScale;
   const cx = W * 0.72;
@@ -337,9 +463,7 @@ function drawSun(pal) {
   g.addColorStop(0, rgb(pal.sunTop));
   g.addColorStop(1, rgb(pal.sunBot));
   ctx.fillStyle = g;
-  // 上半分は塗りつぶし
   ctx.fillRect(cx - r, cy - r, r * 2, r * 0.85);
-  // 下半分は帯状に(下に行くほど隙間が広がる)
   let y = cy - r * 0.15;
   let band = r * 0.14, gap = r * 0.04;
   while (y < cy + r) {
@@ -349,6 +473,25 @@ function drawSun(pal) {
     gap *= 1.5;
   }
   ctx.restore();
+}
+
+function drawClouds(pal) {
+  for (const c of clouds) {
+    const span = W + 240;
+    const x = (((c.x * W - bgOffset * 0.05 * c.sp) % span) + span) % span - 120;
+    const y = c.y * groundY();
+    const r = 26 * c.s;
+    ctx.beginPath();
+    ctx.arc(x, y, r, Math.PI, 0);
+    ctx.arc(x + r * 1.1, y - r * 0.35, r * 0.8, Math.PI, 0);
+    ctx.arc(x + r * 2.1, y, r * 0.9, Math.PI, 0);
+    ctx.closePath();
+    ctx.fillStyle = rgb(pal.cloud, 0.3);
+    ctx.fill();
+    ctx.strokeStyle = rgb(pal.cloud, 0.55);
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
 }
 
 // 連続した稜線を作る関数(world座標基準なのでスクロールしても形が安定する)
@@ -381,6 +524,94 @@ function drawMountainLayer(ridgeFn, speed, maxH, fillColor, ridgeColor, glow) {
   ctx.shadowBlur = glow;
   ctx.stroke();
   ctx.restore();
+}
+
+// ネオン都市のスカイライン(窓明かり・アンテナの点滅ライト付き)
+function drawCity(pal, now) {
+  const gy = groundY();
+  const speed = 0.22, bw = 88;
+  const off = bgOffset * speed;
+  const start = Math.floor(off / bw) - 1;
+  const count = Math.ceil(W / bw) + 3;
+  for (let i = start; i < start + count; i++) {
+    const x = i * bw - off;
+    const bh = (0.3 + 0.6 * hash(i * 3.71)) * H * 0.17 + H * 0.035;
+    const w = bw - 12 - hash(i * 7.3) * 18;
+    ctx.fillStyle = rgb(pal.city);
+    ctx.fillRect(x, gy - bh, w, bh);
+    // 窓明かり
+    const cols = Math.max(2, Math.floor(w / 16));
+    const rows = Math.max(2, Math.floor(bh / 20));
+    ctx.fillStyle = rgb(pal.window, 0.85);
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        if (hash(i * 97.3 + r * 13.7 + c * 5.1) > 0.6) {
+          ctx.fillRect(
+            x + 5 + c * ((w - 10) / cols),
+            gy - bh + 7 + r * ((bh - 12) / rows),
+            3, 4
+          );
+        }
+      }
+    }
+    // 高層ビルにはアンテナと点滅する航空灯
+    if (hash(i * 11.7) > 0.68) {
+      ctx.strokeStyle = rgb(pal.city);
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(x + w / 2, gy - bh);
+      ctx.lineTo(x + w / 2, gy - bh - 14);
+      ctx.stroke();
+      const blink = 0.5 + 0.5 * Math.sin(now * 0.004 + i * 2.3);
+      ctx.fillStyle = `rgba(255,70,90,${0.3 + 0.7 * blink})`;
+      ctx.fillRect(x + w / 2 - 2, gy - bh - 17, 4, 4);
+    }
+  }
+}
+
+// ネオンのヤシの木(道路脇を流れていく)
+function drawPalm(x, gy, ph, pal) {
+  ctx.save();
+  ctx.strokeStyle = rgb(pal.ridge, 0.95);
+  ctx.shadowColor = rgb(pal.ridge);
+  ctx.shadowBlur = 8;
+  ctx.lineCap = 'round';
+  // 幹(ゆるくカーブ)
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(x, gy);
+  ctx.quadraticCurveTo(x + 5, gy - ph * 0.6, x + 13, gy - ph);
+  ctx.stroke();
+  // 葉(6本の垂れる葉)
+  ctx.lineWidth = 2.5;
+  const tx = x + 13, ty = gy - ph;
+  for (let k = 0; k < 6; k++) {
+    const ang = -Math.PI * 0.92 + k * (Math.PI * 0.84 / 5);
+    const len = ph * 0.42;
+    ctx.beginPath();
+    ctx.moveTo(tx, ty);
+    ctx.quadraticCurveTo(
+      tx + Math.cos(ang) * len * 0.7, ty + Math.sin(ang) * len * 0.7 - 5,
+      tx + Math.cos(ang) * len, ty + Math.sin(ang) * len + len * 0.45
+    );
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawPalms(pal) {
+  const gy = groundY();
+  const speed = 0.55, spacing = 420;
+  const off = bgOffset * speed;
+  const start = Math.floor(off / spacing) - 1;
+  const count = Math.ceil(W / spacing) + 3;
+  for (let i = start; i < start + count; i++) {
+    if (hash(i * 2.9) < 0.3) continue; // たまに欠番にしてリズムを崩す
+    const x = i * spacing + hash(i * 5.3) * 220 - off;
+    if (x < -80 || x > W + 80) continue;
+    const ph = H * 0.12 * (0.8 + 0.45 * hash(i * 8.8));
+    drawPalm(x, gy, ph, pal);
+  }
 }
 
 function drawGround(pal) {
@@ -419,6 +650,18 @@ function drawGround(pal) {
   }
   ctx.stroke();
 
+  // 路面を流れるスピードライン(疾走感)
+  for (const sl of speedLines) {
+    const y = gy + (H - gy) * sl.t * sl.t + 6;
+    const len = 22 + 60 * sl.t;
+    ctx.strokeStyle = rgb(pal.grid, 0.15 + 0.3 * sl.t);
+    ctx.lineWidth = 1 + 2 * sl.t;
+    ctx.beginPath();
+    ctx.moveTo(sl.x, y);
+    ctx.lineTo(sl.x + len, y);
+    ctx.stroke();
+  }
+
   // 地平線のネオンライン
   ctx.save();
   ctx.strokeStyle = rgb(pal.grid, 0.95);
@@ -435,13 +678,17 @@ function drawGround(pal) {
 function drawBackground(pal, now) {
   drawSky(pal);
   drawStars(pal, now);
+  drawShootingStar(pal);
   drawSun(pal);
-  drawMountainLayer(ridgeFar, 0.15, H * 0.22, pal.mtFar, pal.ridge, 8);
-  drawMountainLayer(ridgeNear, 0.35, H * 0.13, pal.mtNear, pal.ridge, 12);
+  drawClouds(pal);
+  drawMountainLayer(ridgeFar, 0.15, H * 0.2, pal.mtFar, pal.ridge, 8);
+  drawCity(pal, now);
+  drawMountainLayer(ridgeNear, 0.35, H * 0.09, pal.mtNear, pal.ridge, 10);
   drawGround(pal);
+  drawPalms(pal);
 }
 
-// ===== キャラクター・障害物描画 =====
+// ===== キャラクター・障害物・コイン描画 =====
 function drawPlayer() {
   const { x, y, w, h } = player;
   ctx.save();
@@ -473,34 +720,130 @@ function drawPlayer() {
   ctx.restore();
 }
 
-function drawObstacles() {
+function drawPipe(o) {
+  ctx.save();
+  ctx.shadowColor = '#39ff88';
+  ctx.shadowBlur = 14;
+  const lip = Math.min(16, o.h * 0.3);
+  // 胴体(横グラデーションで円筒に見せる)
+  const bg = ctx.createLinearGradient(o.x, 0, o.x + o.w, 0);
+  bg.addColorStop(0, '#0c5132');
+  bg.addColorStop(0.35, '#2ee07f');
+  bg.addColorStop(0.65, '#2ee07f');
+  bg.addColorStop(1, '#0c5132');
+  ctx.fillStyle = bg;
+  ctx.fillRect(o.x + 3, o.y + lip, o.w - 6, o.h - lip);
+  ctx.strokeStyle = '#7dffb8';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(o.x + 3, o.y + lip, o.w - 6, o.h - lip);
+  // 縁(リップ)
+  const lg = ctx.createLinearGradient(o.x - 3, 0, o.x + o.w + 3, 0);
+  lg.addColorStop(0, '#0c5132');
+  lg.addColorStop(0.35, '#3df792');
+  lg.addColorStop(0.65, '#3df792');
+  lg.addColorStop(1, '#0c5132');
+  ctx.fillStyle = lg;
+  ctx.fillRect(o.x - 3, o.y, o.w + 6, lip);
+  ctx.strokeRect(o.x - 3, o.y, o.w + 6, lip);
+  // 口の影
+  ctx.fillStyle = 'rgba(5,30,18,0.7)';
+  ctx.fillRect(o.x + 1, o.y + 2, o.w - 2, 3);
+  ctx.restore();
+}
+
+function drawSpikes(o) {
+  ctx.save();
+  ctx.shadowColor = '#ff3df0';
+  ctx.shadowBlur = 14;
+  const sw = o.w / o.n;
+  const g = ctx.createLinearGradient(0, o.y, 0, o.y + o.h);
+  g.addColorStop(0, '#ff8df8');
+  g.addColorStop(1, '#69155f');
+  for (let i = 0; i < o.n; i++) {
+    const x0 = o.x + i * sw;
+    ctx.beginPath();
+    ctx.moveTo(x0, o.y + o.h);
+    ctx.lineTo(x0 + sw / 2, o.y);
+    ctx.lineTo(x0 + sw, o.y + o.h);
+    ctx.closePath();
+    ctx.fillStyle = g;
+    ctx.fill();
+    ctx.strokeStyle = '#ff5df5';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+  // 根元の光る台座
+  ctx.fillStyle = '#ff5df5';
+  ctx.fillRect(o.x - 2, o.y + o.h - 3, o.w + 4, 3);
+  ctx.restore();
+}
+
+function drawDrone(o) {
   ctx.save();
   ctx.shadowColor = '#ff3df0';
   ctx.shadowBlur = 16;
+  // 機体
+  ctx.fillStyle = '#2a0f33';
+  ctx.beginPath();
+  ctx.ellipse(o.x + o.w / 2, o.y + o.h * 0.62, o.w / 2, o.h * 0.38, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = '#ff5df5';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  // ローター(高速回転して見えるよう幅を振動させる)
+  const rot = Math.cos(o.t * 26);
+  ctx.strokeStyle = 'rgba(255,255,255,0.75)';
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.moveTo(o.x + o.w / 2 - o.w * 0.46 * Math.abs(rot), o.y + 2);
+  ctx.lineTo(o.x + o.w / 2 + o.w * 0.46 * Math.abs(rot), o.y + 2);
+  ctx.stroke();
+  // ローターの支柱
+  ctx.strokeStyle = '#ff5df5';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(o.x + o.w / 2, o.y + 2);
+  ctx.lineTo(o.x + o.w / 2, o.y + o.h * 0.3);
+  ctx.stroke();
+  // 警告ライト(点滅する目)
+  const blink = 0.4 + 0.6 * (0.5 + 0.5 * Math.sin(o.t * 10));
+  ctx.fillStyle = `rgba(255,64,96,${blink})`;
+  ctx.beginPath();
+  ctx.arc(o.x + o.w * 0.32, o.y + o.h * 0.6, 4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawObstacles() {
   for (const o of obstacles) {
-    if (o.kind === 'pylon') {
-      // ネオンの柱
-      ctx.fillStyle = 'rgba(255,61,240,0.22)';
-      ctx.fillRect(o.x, o.y, o.w, o.h);
-      ctx.strokeStyle = '#ff5df5';
-      ctx.lineWidth = 2;
-      ctx.strokeRect(o.x, o.y, o.w, o.h);
-      // 中央の光の芯
-      ctx.fillStyle = '#ffb8fb';
-      ctx.fillRect(o.x + o.w / 2 - 2, o.y + 4, 4, o.h - 8);
-    } else {
-      // ネオンのピラミッド
-      ctx.beginPath();
-      ctx.moveTo(o.x, o.y + o.h);
-      ctx.lineTo(o.x + o.w / 2, o.y);
-      ctx.lineTo(o.x + o.w, o.y + o.h);
-      ctx.closePath();
-      ctx.fillStyle = 'rgba(255,61,240,0.22)';
-      ctx.fill();
-      ctx.strokeStyle = '#ff5df5';
-      ctx.lineWidth = 2;
-      ctx.stroke();
-    }
+    if (o.kind === 'pipe') drawPipe(o);
+    else if (o.kind === 'spikes') drawSpikes(o);
+    else drawDrone(o);
+  }
+}
+
+function drawCoins() {
+  ctx.save();
+  ctx.shadowColor = '#ffd34d';
+  ctx.shadowBlur = 12;
+  for (const c of coins) {
+    const sx = Math.abs(Math.cos(c.phase)); // 回転して見えるよう横幅を伸縮
+    ctx.beginPath();
+    ctx.ellipse(c.x, c.y, COIN_R * Math.max(0.18, sx), COIN_R, 0, 0, Math.PI * 2);
+    const g = ctx.createLinearGradient(0, c.y - COIN_R, 0, c.y + COIN_R);
+    g.addColorStop(0, '#ffe98a');
+    g.addColorStop(1, '#e8a019');
+    ctx.fillStyle = g;
+    ctx.fill();
+    ctx.strokeStyle = '#fff3c4';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    // 内側の刻印リング
+    ctx.beginPath();
+    ctx.ellipse(c.x, c.y, COIN_R * 0.55 * Math.max(0.18, sx), COIN_R * 0.55, 0, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(180,110,20,0.8)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
   }
   ctx.restore();
 }
@@ -516,6 +859,12 @@ function drawGlowText(text, x, y, size, fill, glowColor, weight, align) {
   ctx.fillStyle = fill;
   ctx.fillText(text, x, y);
   ctx.restore();
+}
+
+function drawFloatTexts() {
+  for (const ft of floatTexts) {
+    drawGlowText(ft.text, ft.x, ft.y, 18, `rgba(255,233,138,${Math.min(1, ft.life / 0.5)})`, '#ffd34d');
+  }
 }
 
 function logoGradient(y, size) {
@@ -541,8 +890,10 @@ function drawOverlay(alpha) {
 function draw(now) {
   const pal = currentPalette();
   drawBackground(pal, now);
+  drawCoins();
   drawObstacles();
   drawPlayer();
+  drawFloatTexts();
 
   if (state === 'playing') {
     drawHUD();
@@ -560,7 +911,7 @@ function draw(now) {
     ctx.fillText('ネオンランナー', W / 2, H * 0.34);
     ctx.restore();
     drawGlowText('NEON RUNNER', W / 2, H * 0.34 + logoSize * 0.85, Math.min(W * 0.035, 16), 'rgba(232,251,255,0.7)', 'rgba(55,241,255,0.4)', 'normal');
-    drawGlowText('タップでジャンプ!障害物をよけよう', W / 2, H * 0.49, Math.min(W * 0.042, 19), '#e8fbff', 'rgba(55,241,255,0.4)', 'normal');
+    drawGlowText('タップでジャンプ!コインを集めて障害物をよけろ', W / 2, H * 0.49, Math.min(W * 0.04, 18), '#e8fbff', 'rgba(55,241,255,0.4)', 'normal');
     if (Math.floor(now / 600) % 2 === 0) {
       drawGlowText('タップでスタート', W / 2, H * 0.62, Math.min(W * 0.058, 26), '#fff', '#37f1ff');
     }
