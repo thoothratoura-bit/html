@@ -400,7 +400,7 @@ let shootTimer = 4;
 function groundY() { return H * GROUND_RATIO; }
 
 // ===== 難易度カーブ =====
-function speedMul() { return 1 + 0.8 * Math.min(1, dist / 20000); }
+function speedMul() { return 1 + 0.9 * Math.min(1, dist / 18000); }
 function gameSpeed() { return BASE_SPEED * speedMul(); }
 function currentTier() { return dist < 3500 ? 0 : dist < 10000 ? 1 : 2; }
 
@@ -716,6 +716,20 @@ const PATTERNS = [
       addCoinArc(x + 48, 5, 170);
       return 160;
     } },
+  { tier: 2, build(x, sm) { // 三連土管(タッタッタッとリズムジャンプ)
+      const g = 205 * sm;
+      addPipe(x, 56);
+      addPipe(x + g, 62);
+      addPipe(x + g * 2, 56);
+      addCoinArc(x + g + 23, 3, 160);
+      return g * 2 + 150;
+    } },
+  { tier: 2, build(x, sm) { // ドローンをくぐった直後にスパイク(我慢してから跳ぶ)
+      addDrone(x, 8 + Math.random() * 16);
+      addSpikes(x + 165 * sm, 2, 36);
+      addCoinRow(x - 44, 3, groundY() - 42);
+      return 165 * sm + 120;
+    } },
 ];
 
 let firstSpawn = true;
@@ -728,7 +742,7 @@ function spawnPattern() {
   const sm = speedMul();
   const w = p.build(W + 100, sm);
   const jumpDist = gameSpeed() * 0.68;
-  const gap = jumpDist * (1.5 + Math.random() * 0.9 - tier * 0.12);
+  const gap = jumpDist * (1.5 + Math.random() * 0.9 - tier * 0.22);
   spawnTimer = (w + gap) / gameSpeed();
 }
 
